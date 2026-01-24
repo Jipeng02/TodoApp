@@ -1,0 +1,27 @@
+# 编译输出目录
+bin/
+obj/
+
+# 用户特定的配置文件
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet 包管理生成的文件
+project.lock.json
+project.fragment.lock.json
+*.nuget.g.props
+*.nuget.g.targets
+
+# 自动生成的文件
+*.GeneratedMSBuildEditorConfig.editorconfig
+*.GlobalUsings.g.cs
+*.AssemblyAttributes.cs
+
+# Visual Studio 文件
+.vscode/
+.vs/
+
+# 其他
+*.log

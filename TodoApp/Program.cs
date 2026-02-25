@@ -6,6 +6,7 @@ public class Program
 {
     private static readonly TimeSpan FetchWindow = TimeSpan.FromHours(24);
     private static readonly int MaxItemsToShow = 12;
+    private const int TelegramMaxMessageLength = 3500;
 
     private static readonly string[] MajorKeywords =
     [
@@ -133,9 +134,8 @@ public class Program
             var title = EscapeMarkdownV2(item.Title);
             var source = EscapeMarkdownV2(item.Source);
             var date = EscapeMarkdownV2(dateText);
-            var link = EscapeMarkdownV2(item.Link);
             builder.AppendLine($"{index}. [{source}] {title}");
-            builder.AppendLine($"   {date} | {link}");
+            builder.AppendLine($"   {date} | {item.Link}");
             index++;
         }
 
@@ -238,17 +238,97 @@ public class Program
         string message,
         CancellationToken cancellationToken)
     {
-        var url = $"https://api.telegram.org/bot{botToken}/sendMessage";
-        using var content = new FormUrlEncodedContent(
-        [
-            new KeyValuePair<string, string>("chat_id", chatId),
-            new KeyValuePair<string, string>("text", message),
-            new KeyValuePair<string, string>("parse_mode", "MarkdownV2"),
-            new KeyValuePair<string, string>("disable_web_page_preview", "true")
-        ]);
+        foreach (var chunk in SplitMessage(message, TelegramMaxMessageLength))
+        {
+            var sent = await TrySendTelegramMessageAsync(
+                client,
+                botToken,
+                chatId,
+                chunk,
+                "MarkdownV2",
+                cancellationToken);
 
+            if (!sent)
+            {
+                Console.WriteLine("[WARN] MarkdownV2 failed, retrying without parse_mode.");
+                var fallbackSent = await TrySendTelegramMessageAsync(
+                    client,
+                    botToken,
+                    chatId,
+                    chunk,
+                    null,
+                    cancellationToken);
+
+                if (!fallbackSent)
+                {
+                    throw new HttpRequestException("Telegram sendMessage failed after retry.");
+                }
+            }
+        }
+    }
+
+    private static async Task<bool> TrySendTelegramMessageAsync(
+        HttpClient client,
+        string botToken,
+        string chatId,
+        string message,
+        string? parseMode,
+        CancellationToken cancellationToken)
+    {
+        var url = $"https://api.telegram.org/bot{botToken}/sendMessage";
+        var payload = new List<KeyValuePair<string, string>>
+        {
+            new("chat_id", chatId),
+            new("text", message),
+            new("disable_web_page_preview", "true")
+        };
+
+        if (!string.IsNullOrWhiteSpace(parseMode))
+        {
+            payload.Add(new KeyValuePair<string, string>("parse_mode", parseMode));
+        }
+
+        using var content = new FormUrlEncodedContent(payload);
         using var response = await client.PostAsync(url, content, cancellationToken);
-        response.EnsureSuccessStatusCode();
+
+        if (response.IsSuccessStatusCode)
+        {
+            return true;
+        }
+
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        Console.WriteLine($"[ERROR] Telegram API error {(int)response.StatusCode}: {body}");
+        return false;
+    }
+
+    private static IEnumerable<string> SplitMessage(string message, int maxLength)
+    {
+        if (message.Length <= maxLength)
+        {
+            yield return message;
+            yield break;
+        }
+
+        var lines = message.Split('\n');
+        var builder = new StringBuilder();
+        foreach (var line in lines)
+        {
+            if (builder.Length + line.Length + 1 > maxLength)
+            {
+                if (builder.Length > 0)
+                {
+                    yield return builder.ToString().TrimEnd();
+                    builder.Clear();
+                }
+            }
+
+            builder.AppendLine(line);
+        }
+
+        if (builder.Length > 0)
+        {
+            yield return builder.ToString().TrimEnd();
+        }
     }
 
     private static string EscapeMarkdownV2(string text)

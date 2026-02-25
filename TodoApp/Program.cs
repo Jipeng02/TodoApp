@@ -1,11 +1,9 @@
-﻿using System.Globalization;
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Xml.Linq;
 
 public class Program
 {
-    private static readonly TimeSpan DefaultPushTimeLocal = new(9, 0, 0);
     private static readonly TimeSpan FetchWindow = TimeSpan.FromHours(24);
     private static readonly int MaxItemsToShow = 12;
 
@@ -65,19 +63,6 @@ public class Program
 
     public static async Task Main(string[] args)
     {
-        var timeZoneId = GetEnvironmentValue("TIME_ZONE", "Asia/Shanghai");
-        var pushTime = ParsePushTime(GetEnvironmentValue("PUSH_TIME", "09:00"));
-
-        var timeZone = ResolveTimeZone(timeZoneId);
-        var nowUtc = DateTimeOffset.UtcNow;
-        var nowLocal = TimeZoneInfo.ConvertTime(nowUtc, timeZone);
-
-        if (!ShouldRunNow(nowLocal, pushTime))
-        {
-            Console.WriteLine($"Skip run: now {nowLocal:yyyy-MM-dd HH:mm} in {timeZone.Id}, target {pushTime:hh\\:mm}.");
-            return;
-        }
-
         var botToken = GetEnvironmentValue("TELEGRAM_BOT_TOKEN", "");
         var chatId = GetEnvironmentValue("TELEGRAM_CHAT_ID", "");
 
@@ -88,7 +73,7 @@ public class Program
         }
 
         using var client = CreateHttpClient();
-        var summary = await BuildDailySummaryAsync(client, nowUtc, CancellationToken.None);
+        var summary = await BuildDailySummaryAsync(client, DateTimeOffset.UtcNow, CancellationToken.None);
 
         if (string.IsNullOrWhiteSpace(summary))
         {
@@ -104,34 +89,6 @@ public class Program
     {
         var value = Environment.GetEnvironmentVariable(name);
         return string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
-    }
-
-    private static TimeSpan ParsePushTime(string value)
-    {
-        if (TimeSpan.TryParseExact(value, "hh\\:mm", CultureInfo.InvariantCulture, out var time))
-        {
-            return time;
-        }
-
-        return DefaultPushTimeLocal;
-    }
-
-    private static TimeZoneInfo ResolveTimeZone(string timeZoneId)
-    {
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
-        }
-        catch
-        {
-            Console.WriteLine($"Unknown TIME_ZONE '{timeZoneId}', fallback to UTC.");
-            return TimeZoneInfo.Utc;
-        }
-    }
-
-    private static bool ShouldRunNow(DateTimeOffset nowLocal, TimeSpan targetTime)
-    {
-        return nowLocal.Hour == targetTime.Hours && nowLocal.Minute == targetTime.Minutes;
     }
 
     private static HttpClient CreateHttpClient()
@@ -167,7 +124,7 @@ public class Program
         }
 
         var builder = new StringBuilder();
-        builder.AppendLine(EscapeMarkdownV2($"AI 大事速览 - {DateTimeOffset.Now:yyyy-MM-dd}"));
+        builder.AppendLine(EscapeMarkdownV2($"AI 大事速览 - {DateTimeOffset.Now:yyyy-MM-dd HH:mm}"));
 
         var index = 1;
         foreach (var item in allItems)

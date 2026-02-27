@@ -1,5 +1,6 @@
 ﻿using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 using System.Xml.Linq;
 
 public class Program
@@ -74,15 +75,18 @@ public class Program
         }
 
         using var client = CreateHttpClient();
-        var summary = await BuildDailySummaryAsync(client, DateTimeOffset.UtcNow, CancellationToken.None);
+        var nowUtc = DateTimeOffset.UtcNow;
+        var summary = await BuildDailySummaryAsync(client, nowUtc, CancellationToken.None);
+        var goldMessage = await BuildGoldPriceMessageAsync(client, nowUtc, CancellationToken.None);
 
-        if (string.IsNullOrWhiteSpace(summary))
+        if (string.IsNullOrWhiteSpace(summary) && string.IsNullOrWhiteSpace(goldMessage))
         {
-            Console.WriteLine("No major items found in the last 24 hours.");
+            Console.WriteLine("No major items or gold price data available.");
             return;
         }
 
-        await SendTelegramMessageAsync(client, botToken, chatId, summary, CancellationToken.None);
+        var combined = CombineSections(summary, goldMessage);
+        await SendTelegramMessageAsync(client, botToken, chatId, combined, CancellationToken.None);
         Console.WriteLine("Telegram message sent.");
     }
 
@@ -124,13 +128,17 @@ public class Program
             return string.Empty;
         }
 
+        var timeZone = GetTimeZone();
+        var nowLocal = TimeZoneInfo.ConvertTime(nowUtc, timeZone);
         var builder = new StringBuilder();
-        builder.AppendLine(EscapeMarkdownV2($"AI 大事速览 - {DateTimeOffset.Now:yyyy-MM-dd HH:mm}"));
+        builder.AppendLine(EscapeMarkdownV2($"AI 大事速览 - {nowLocal:yyyy-MM-dd HH:mm}"));
 
         var index = 1;
         foreach (var item in allItems)
         {
-            var dateText = item.Published?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "时间未知";
+            var dateText = item.Published.HasValue
+                ? TimeZoneInfo.ConvertTime(item.Published.Value, timeZone).ToString("yyyy-MM-dd HH:mm")
+                : "时间未知";
             var title = EscapeMarkdownV2(item.Title);
             var source = EscapeMarkdownV2(item.Source);
             var date = EscapeMarkdownV2(dateText);
@@ -140,6 +148,77 @@ public class Program
         }
 
         return builder.ToString();
+    }
+
+    private static async Task<string> BuildGoldPriceMessageAsync(
+        HttpClient client,
+        DateTimeOffset nowUtc,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = await FetchGoldPriceAsync(client, cancellationToken);
+        if (snapshot == null)
+        {
+            return string.Empty;
+        }
+
+        var timeZone = GetTimeZone();
+        var nowLocal = TimeZoneInfo.ConvertTime(nowUtc, timeZone);
+        var snapshotLocal = TimeZoneInfo.ConvertTime(snapshot.Timestamp, timeZone);
+        var builder = new StringBuilder();
+        builder.AppendLine(EscapeMarkdownV2($"金价快报 - {nowLocal:yyyy-MM-dd HH:mm}"));
+        builder.AppendLine(EscapeMarkdownV2($"现货黄金: {snapshot.PriceUsdPerOunce:0.00} USD/oz"));
+        builder.AppendLine(EscapeMarkdownV2($"时间: {snapshotLocal:yyyy-MM-dd HH:mm}"));
+        builder.AppendLine(EscapeMarkdownV2("来源: metals.live"));
+        return builder.ToString();
+    }
+
+    private static async Task<GoldPriceSnapshot?> FetchGoldPriceAsync(
+        HttpClient client,
+        CancellationToken cancellationToken)
+    {
+        var url = GetEnvironmentValue("GOLD_PRICE_URL", "https://api.metals.live/v1/spot/gold");
+        try
+        {
+            using var response = await client.GetAsync(url, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            var content = await response.Content.ReadAsStringAsync(cancellationToken);
+            using var doc = JsonDocument.Parse(content);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0)
+            {
+                return null;
+            }
+
+            var first = doc.RootElement[0];
+            if (first.ValueKind != JsonValueKind.Array || first.GetArrayLength() < 2)
+            {
+                return null;
+            }
+
+            var timestamp = first[0].GetInt64();
+            var price = ReadDecimal(first[1]);
+            if (price <= 0)
+            {
+                return null;
+            }
+
+            var time = DateTimeOffset.FromUnixTimeSeconds(timestamp);
+            return new GoldPriceSnapshot(price, time);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Failed to fetch gold price: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static decimal ReadDecimal(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Number when element.TryGetDecimal(out var value) => value,
+            JsonValueKind.Number => Convert.ToDecimal(element.GetDouble()),
+            _ => 0m
+        };
     }
 
     private static bool IsMajorItem(FeedItem item)
@@ -352,6 +431,50 @@ public class Program
         return builder.ToString();
     }
 
+    private static TimeZoneInfo GetTimeZone()
+    {
+        var timeZoneId = GetEnvironmentValue("TIME_ZONE", "Asia/Shanghai");
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            Console.WriteLine($"[WARN] Time zone '{timeZoneId}' not found. Falling back to local time.");
+            return TimeZoneInfo.Local;
+        }
+        catch (InvalidTimeZoneException)
+        {
+            Console.WriteLine($"[WARN] Time zone '{timeZoneId}' invalid. Falling back to local time.");
+            return TimeZoneInfo.Local;
+        }
+    }
+
     private sealed record FeedSource(string Name, string Url);
     private sealed record FeedItem(string Title, string Link, DateTimeOffset? Published, string Summary, string Source);
+    private sealed record GoldPriceSnapshot(decimal PriceUsdPerOunce, DateTimeOffset Timestamp);
+
+    private static string CombineSections(params string[] sections)
+    {
+        var builder = new StringBuilder();
+        var first = true;
+        foreach (var section in sections)
+        {
+            if (string.IsNullOrWhiteSpace(section))
+            {
+                continue;
+            }
+
+            if (!first)
+            {
+                builder.AppendLine();
+            }
+
+            builder.Append(section.TrimEnd());
+            first = false;
+        }
+
+        return builder.ToString();
+    }
 }
+
